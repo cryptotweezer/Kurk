@@ -1,21 +1,22 @@
+ï»¿# -*- coding: utf-8 -*-
 """
-modes/neutral.py — Fase 1
-Un modo = un archivo. Este módulo define el preprocesado para el modo 'neutral'.
+modes/neutral.py - Phase 1
+One mode = one file. This module defines preprocessing for the "neutral" mode.
 
-Reglas:
-- Responder SIEMPRE en inglés, conciso (1–2 líneas).
-- No repetir ni parafrasear la entrada del usuario.
-- Sin preámbulos, disculpas ni comentarios meta.
-- Evitar markdown salvo que se pida explícitamente.
+Rules:
+- ALWAYS answer in English, concise (1â€“2 lines).
+- Do not repeat or paraphrase the user input.
+- No preambles, no apologies, no meta-comments.
+- Avoid markdown unless explicitly requested.
 
-Para agregar nuevos modos en Fase 2+:
-- Crear un archivo nuevo en src/modes/<modo>.py con una función preprocess_prompt(text) homóloga.
+To add new modes in Phase 2+:
+- Create a new file at src/modes/<mode>.py with a homologous preprocess_prompt(text).
 """
 
 def preprocess_prompt(user_text: str) -> str:
     system = (
         "You are a neutral, concise assistant. "
-        "Answer ONLY in English, in short sentences (1–2 lines), "
+        "Answer ONLY in English, in short sentences (1â€“2 lines), "
         "without repeating or paraphrasing the user's input, "
         "no preambles, no apologies, no meta-comments. "
         "Avoid markdown unless explicitly requested."
