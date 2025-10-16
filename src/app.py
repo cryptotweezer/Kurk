@@ -6,10 +6,10 @@ Ejecución:
 (.venv) PS C:\AI_Workspace\Kurk> uvicorn src.app:app --host 127.0.0.1 --port 8000 --reload
 
 Notas:
-- Este backend expone /say para pruebas externas (POST con {"text": "..."}).
-- Internamente orquesta: OpenAI Realtime (tokens parciales) -> Coqui XTTS -> CABLE Input.
-- No persiste audio en disco (streaming en memoria).
-- Métricas de latencia se imprimen en logs (timestamps).
+- Backend expone /say para pruebas externas (POST con {"text": "..."}).
+- Orquesta: OpenAI Realtime (tokens parciales) -> Coqui XTTS -> CABLE Input.
+- Sin persistir audio (streaming en memoria).
+- Imprime métricas de latencia en logs (timestamps).
 """
 
 from fastapi import FastAPI, HTTPException
@@ -32,12 +32,11 @@ AUDIO_CH = int(os.getenv("AUDIO_CHANNELS", "1"))
 if not OPENAI_API_KEY:
     raise RuntimeError("Falta OPENAI_API_KEY en .env")
 
-# Importes de los módulos (se implementan en pasos siguientes)
-# Cada módulo debe ser estrictamente 'streaming' y sin persistencia a disco.
+# ===== Imports internos (cada módulo aislado) =====
 from .llm_realtime import stream_completion  # async generator de tokens parciales
 from .tts_coqui import init_tts, stream_tts_from_text_chunks  # inicializa TTS y sintetiza en streaming
-from .audio_pipe import init_audio_out, close_audio_out        # gestiona salida a CABLE Input
-from .modes import preprocess_prompt                           # placeholder para futuras personalidades
+from .audio_pipe import init_audio_out, close_audio_out        # gestiona salida a CABLE Input (VB-Audio)
+from .modes.neutral import preprocess_prompt                   # MODO NEUTRAL (1 archivo = 1 modo)
 
 app = FastAPI(title="KURK Phase 1 API", version="0.1.0")
 
@@ -51,7 +50,7 @@ app.add_middleware(
 
 class SayIn(BaseModel):
     text: str
-    mode: Optional[str] = "neutral"  # placeholder (Fase 2+)
+    mode: Optional[str] = "neutral"  # placeholder (para Fase 2+)
 
 @app.on_event("startup")
 async def on_startup():
@@ -83,14 +82,12 @@ async def say(payload: SayIn):
     if not user_text:
         raise HTTPException(status_code=400, detail="text vacío")
 
-    # Filtro Fase1: no repetir input del usuario (sin /echo)
-    prompt = preprocess_prompt(user_text, mode=payload.mode)
+    # Fase 1: no repetir input del usuario (sin /echo)
+    prompt = preprocess_prompt(user_text)
 
     t0 = time.perf_counter()
     print(f"[/say] ⏱️ start ts={t0:.6f} prompt='{prompt[:120]}'…")
 
-    # Llama al generador asíncrono de tokens parciales
-    # stream_completion debe emitir strings cortos (tokens/frases) tan pronto como estén listos
     tokens_count = 0
     first_audio_ts: Optional[float] = None
 
@@ -104,10 +101,10 @@ async def say(payload: SayIn):
                 continue
             tokens_count += 1
 
-            # La función de TTS en streaming debe iniciar el audio con un prebuffer ~100–200ms.
-            # También debe manejar backpressure para no saturar el dispositivo de salida.
             if first_audio_ts is None:
                 first_audio_ts = time.perf_counter()
+
+            # TTS en streaming con prebuffer ~100–200 ms y control de backpressure
             await stream_tts_from_text_chunks(chunk)
 
     except Exception as e:
@@ -120,7 +117,6 @@ async def say(payload: SayIn):
 
     print(f"[/say] ✅ done tokens={tokens_count} total_ms={total:.1f} first_audio_ms={first_audio_ms:.1f if first_audio_ms else -1}")
 
-    # Devolvemos métricas básicas
     return {
         "ok": True,
         "tokens": tokens_count,
