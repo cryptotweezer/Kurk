@@ -1,28 +1,25 @@
 """
-llm_realtime.py — Fase 1 (WS Realtime + fallback no bloqueante)
+llm_realtime.py — Fase 1
+WS Realtime preferido + fallback HTTP streaming puro (sin SDK) con httpx.
 
-- Intenta OpenAI Realtime por WebSocket (tokens parciales).
-- Si en N segundos no llega el primer delta o falla el WS, hace fallback a
-  Chat Completions streaming en un hilo (no bloquea el event loop).
-- Emite chunks por oración para disparar TTS cuanto antes.
+- Primero intenta Realtime (WebSocket). Si no llega el primer delta en N s, cae a fallback.
+- Fallback: llama /v1/chat/completions con stream=true y parsea SSE "data:".
+- Emite trozos por oración para disparar TTS cuanto antes.
 """
 
 from __future__ import annotations
 import asyncio
 import json
 import os
-import queue
 import re
-import threading
 from typing import AsyncGenerator, Optional
 
+import httpx
 import websockets
-from openai import OpenAI
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gpt-4o-mini")  # modelo para chat.completions
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gpt-4o-mini")
 
-# Detectar fin de oración o salto de línea
 _SENTENCE_SPLIT_RE = re.compile(r"([\.!\?]+[\)\]]?\s+|[\n\r]+)")
 
 def _yieldable_chunks_from_buffer(buf: str, force: bool = False):
@@ -42,61 +39,55 @@ def _yieldable_chunks_from_buffer(buf: str, force: bool = False):
     return parts, buf[last:]
 
 
-# ===================== FALLBACK (chat.completions stream) =====================
+# =================== Fallback HTTP (SSE) con httpx (async) ===================
 
-def _chat_stream_thread(api_key: str, model: str, prompt: str, q: "queue.Queue[Optional[str]]"):
+async def _http_chat_stream_fallback_async(api_key: str, prompt: str) -> AsyncGenerator[str, None]:
     """
-    Hilo bloqueante que consume el stream de chat.completions y empuja deltas a la cola.
-    Al finalizar, encola None como centinela.
+    Streaming directo contra /v1/chat/completions (OpenAI) usando httpx.
+    Parseo de Server-Sent Events (líneas que empiezan con 'data: ').
     """
-    try:
-        client = OpenAI(api_key=api_key)
-        stream = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            stream=True,
-        )
-        for event in stream:
-            try:
-                choice = event.choices[0]
-                delta = getattr(choice.delta, "content", None)
-                if delta:
-                    q.put(delta, timeout=1)
-            except Exception:
-                # Ignorar eventos no textuales
-                pass
-        q.put(None, timeout=1)
-    except Exception as e:
-        # Propagamos error en texto para que el caller levante 500
-        q.put(f"__ERROR__:{repr(e)}", timeout=1)
-        q.put(None, timeout=1)
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": FALLBACK_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+    }
 
-async def _chat_stream_fallback_async(api_key: str, prompt: str) -> AsyncGenerator[str, None]:
-    """
-    Wrapper asíncrono que ejecuta el hilo de completions stream y va sacando deltas sin
-    bloquear el event loop. Hace sentence-chunking antes de yield.
-    """
-    q: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=1024)
-    th = threading.Thread(target=_chat_stream_thread, args=(api_key, FALLBACK_MODEL, prompt, q), daemon=True)
-    th.start()
-
-    buffer = ""
-    while True:
-        # Espera cooperativa al siguiente item de la cola
-        item = await asyncio.to_thread(q.get)
-        if item is None:
-            # flush final
-            if buffer.strip():
-                parts, buffer = _yieldable_chunks_from_buffer(buffer, force=True)
-                for p in parts:
-                    yield p
-            break
-        if item.startswith("__ERROR__:"):
-            raise RuntimeError(f"HTTP fallback error: {item}")
-        buffer += item
-        parts, buffer = _yieldable_chunks_from_buffer(buffer, force=False)
-        for p in parts:
-            yield p
+    timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, headers=headers, json=payload) as r:
+            r.raise_for_status()
+            text_buffer = ""
+            async for raw_line in r.aiter_lines():
+                if not raw_line:
+                    continue
+                if raw_line.startswith("data: "):
+                    data = raw_line[6:].strip()
+                    if data == "[DONE]":
+                        # flush final
+                        if text_buffer.strip():
+                            parts, text_buffer = _yieldable_chunks_from_buffer(text_buffer, force=True)
+                            for p in parts:
+                                yield p
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    # Formato chat.completions stream
+                    try:
+                        delta = obj["choices"][0]["delta"].get("content")
+                    except Exception:
+                        delta = None
+                    if delta:
+                        text_buffer += delta
+                        parts, text_buffer = _yieldable_chunks_from_buffer(text_buffer, force=False)
+                        for p in parts:
+                            yield p
 
 
 # ========================= WebSocket Realtime (preferido) =========================
@@ -137,7 +128,7 @@ async def stream_completion(
         async with websockets.connect(
             url,
             extra_headers=headers,
-            subprotocols=["realtime"],      # importante para algunos gateways
+            subprotocols=["realtime"],      # importante
             open_timeout=connect_timeout,
             ping_interval=20,
             ping_timeout=20,
@@ -160,7 +151,6 @@ async def stream_completion(
 
             ws_task = asyncio.create_task(_ws_recv_json(ws))
             while True:
-                # Si no llegó ningún delta a tiempo, cambiamos a fallback
                 if not got_first and asyncio.get_event_loop().time() > first_deadline:
                     raise TimeoutError("No WS delta in deadline -> fallback")
 
@@ -197,6 +187,6 @@ async def stream_completion(
         return  # éxito por WS
 
     except Exception:
-        # ====== Fallback no bloqueante (chat.completions stream en hilo) ======
-        async for chunk in _chat_stream_fallback_async(api_key=api_key, prompt=prompt):
+        # ====== Fallback HTTP puro (no SDK) ======
+        async for chunk in _http_chat_stream_fallback_async(api_key=api_key, prompt=prompt):
             yield chunk
