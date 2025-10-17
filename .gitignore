@@ -1,5 +1,18 @@
+﻿# === Secrets / entorno ===
+.env
+.env.local
+.env.*.local
+
+# === Audio y assets privados ===
+assets/voice.wav
+
+# === Python / IDE / SO ===
 .venv/
 __pycache__/
 *.pyc
-.env
-*.wav
+*.pyo
+*.pyd
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
