@@ -1,8 +1,16 @@
-fastapi==0.115.0
+﻿fastapi==0.115.0
 uvicorn[standard]==0.30.6
+httpx==0.28.1
 websockets==12.0
-openai==1.51.0
 python-dotenv==1.0.1
 sounddevice==0.4.7
 numpy==1.26.4
+# Coqui XTTS v2 stack
 TTS==0.22.0
+# Torch CUDA 12.1 build for RTX 30-series
+torch==2.5.1+cu121 ; platform_system=="Windows"
+torchaudio==2.5.1+cu121 ; platform_system=="Windows"
+torchvision==0.20.1+cu121 ; platform_system=="Windows"
+# Pins for Coqui/Transformers API changes
+transformers==4.36.2
+tokenizers==0.15.2

@@ -1,195 +1,252 @@
+# -*- coding: utf-8 -*-
 """
-audio_pipe.py — Fase 1
-Salida de audio PCM en tiempo real hacia "CABLE Input (VB-Audio Virtual Cable)"
-usando sounddevice (WASAPI en Windows), 48 kHz mono, sin persistir en disco.
+audio_pipe.py
+WASAPI output → VB-Audio CABLE Input (48 kHz, mono), low-latency callback + FIFO.
+- Float32 pipeline, sin escritura a disco.
+- Soft-clip 0.98 para evitar clipping en OBS.
+- Selección de dispositivo por substring (AUDIO_DEVICE_NAME), fallback al default.
 
-API expuesta:
-- init_audio_out(sample_rate: int = 48000, channels: int = 1) -> None
-- write_audio(samples: np.ndarray float32 mono) -> None
-- close_audio_out() -> None
+Env (.env):
+  AUDIO_DEVICE_NAME=CABLE Input (VB-Audio Virtual Cable)
+  SR=48000
+  CHANNELS=1
+  LOG_LEVEL=INFO
 
-Diseño:
-- Cola FIFO de chunks (float32 mono) protegida para hilos.
-- Callback WASAPI vacía la cola, aplica limitador suave y rellena con silencio si está vacía.
-- Bloques pequeños para baja latencia (p. ej., 256–480 frames).
+API:
+  init_audio_output() -> AudioPipe
+  audio = init_audio_output(); audio.start(); audio.put_pcm(np.ndarray[float32, mono])
 """
 
 from __future__ import annotations
+
 import os
-import queue
+import time
+import logging
 import threading
+from collections import deque
 from typing import Optional
 
 import numpy as np
 import sounddevice as sd
 
-# ====== Estado global ======
-_QUEUE: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=64)  # buffers ~ cortos
-_STREAM: Optional[sd.OutputStream] = None
-_SR: int = 48000
-_CH: int = 1
-_DEVICE_NAME_HINT: str = os.getenv("AUDIO_DEVICE_NAME", "CABLE Input (VB-Audio Virtual Cable)")
-_SOFT_CLIP_LIMIT = 0.98  # techo para anti-clipping
-_BLOCKSIZE = 480         # ~10 ms a 48 kHz
-_LATENCY = "low"         # hint para WASAPI
 
-# ====== Utilidades ======
-def _soft_clip(x: np.ndarray, limit: float = _SOFT_CLIP_LIMIT) -> np.ndarray:
-    if x.size == 0:
-        return x
-    # limitador simple por pico
-    m = np.max(np.abs(x))
-    if m > limit and m > 0:
-        x = (x / m) * limit
-    return x.astype(np.float32, copy=False)
+# ---------- Config ----------
+ENV_AUDIO_NAME = os.getenv("AUDIO_DEVICE_NAME", "CABLE Input")
+SR = int(os.getenv("SR", "48000"))
+CH = int(os.getenv("CHANNELS", "1"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-def _find_output_device(name_hint: str) -> Optional[int]:
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | audio_pipe | %(message)s",
+)
+logger = logging.getLogger("audio_pipe")
+
+
+# ---------- Utilidades de dispositivo ----------
+def _find_output_device_index(name_substr: str) -> Optional[int]:
     """
-    Busca un dispositivo de salida que contenga 'name_hint' (case-insensitive).
-    Devuelve el índice de sounddevice o None si no se encuentra.
+    Busca un dispositivo de salida cuyo nombre contenga 'name_substr' (case-insensitive).
+    Retorna el índice de 'sounddevice' o None si no encuentra.
     """
     try:
         devices = sd.query_devices()
     except Exception as e:
-        print(f"[audio] No se pudo consultar dispositivos: {e}")
+        logger.error(f"No se pudo consultar dispositivos de audio: {e}")
         return None
 
-    hint_l = (name_hint or "").lower()
+    name_substr_low = (name_substr or "").lower()
     best = None
-    for idx, d in enumerate(devices):
-        if d.get("max_output_channels", 0) <= 0:
+    for idx, dev in enumerate(devices):
+        try:
+            if dev.get("max_output_channels", 0) <= 0:
+                continue
+            name = str(dev.get("name", ""))
+            if name_substr_low in name.lower():
+                best = idx
+                break
+        except Exception:
             continue
-        label = f"{d.get('name','')} ({d.get('hostapi','')})"
-        if hint_l and hint_l in d.get("name", "").lower():
-            best = idx
-            break
-        # fallback: si no se da hint, elegimos el primer output válido
-        if not hint_l and best is None:
-            best = idx
+
     return best
 
-# ====== Callback de audio ======
-def _audio_callback(outdata, frames, time_info, status):  # sd.OutputStream callback
-    del time_info  # no usado
-    if status:
-        # underrun/overrun warnings
-        print(f"[audio][cb] status: {status}")
 
-    # Preparamos un buffer de salida (mono) y rellenamos desde la cola
-    buf = np.zeros(frames, dtype=np.float32)
-    filled = 0
-    try:
-        while filled < frames:
+# ---------- Clase principal ----------
+class AudioPipe:
+    """
+    Consumidor de buffers PCM float32 mono a 48 kHz (por defecto), con callback en WASAPI.
+    - put_pcm(): encola buffers (1-D float32 en [-1.0, 1.0], mono).
+    - start()/stop(): controla el stream.
+    """
+
+    def __init__(self, samplerate: int = SR, channels: int = CH, blocksize: int = 480,
+                 device_name_substr: str = ENV_AUDIO_NAME):
+        assert channels == 1, "Fase 1 requiere mono (CHANNELS=1)."
+
+        self.samplerate = int(samplerate)
+        self.channels = int(channels)
+        self.blocksize = int(blocksize)
+        self.device_index = _find_output_device_index(device_name_substr)
+
+        if self.device_index is None:
+            # Fallback: default output
             try:
-                # small chunk dequeue, no bloquear mucho
-                chunk = _QUEUE.get_nowait()
-            except queue.Empty:
-                break
-            if chunk.ndim != 1:
-                chunk = chunk.reshape(-1)
-            n = min(len(chunk), frames - filled)
-            if n > 0:
-                buf[filled:filled+n] = chunk[:n]
-                filled += n
-            # si el chunk era más largo, dejamos el resto para otro callback:
-            remain = len(chunk) - n
-            if remain > 0:
-                _QUEUE.queue.appendleft(chunk[n:])  # reinyectar el sobrante al frente
-                break
-    except Exception as e:
-        # En caso de error, silencio
-        print(f"[audio][cb] error: {e}")
+                default_out = sd.default.device[1]  # (in, out)
+            except Exception:
+                default_out = None
+            self.device_index = default_out
+            logger.warning(
+                f"No se encontró dispositivo que contenga '{device_name_substr}'. "
+                f"Se usará el dispositivo de salida por defecto: {self.device_index}"
+            )
+        else:
+            logger.info(f"Usando dispositivo de salida index={self.device_index} (match '{device_name_substr}').")
 
-    # Anti-clipping suave
-    buf = _soft_clip(buf)
+        # FIFO de chunks (cada chunk es np.ndarray float32 mono)
+        self._queue = deque()
+        self._queue_lock = threading.Lock()
 
-    # Expandir a (frames, channels)
-    if _CH == 1:
-        outdata[:frames, 0] = buf
-    else:
-        # duplicar a estéreo si alguien lo configura así (no recomendado en Fase 1)
-        outdata[:frames, :] = np.tile(buf.reshape(-1, 1), (1, _CH))
+        self._stream: Optional[sd.OutputStream] = None
+        self._running = False
 
+        # Para rate-limiting de logs de underflow
+        self._last_underflow_log = 0.0
 
-# ====== API pública ======
-def init_audio_out(sample_rate: int = 48000, channels: int = 1) -> None:
-    """Inicializa el stream de salida hacia el dispositivo VB-CABLE (o el que coincida con AUDIO_DEVICE_NAME)."""
-    global _STREAM, _SR, _CH
-    _SR = int(sample_rate)
-    _CH = int(channels)
-
-    if _STREAM is not None:
-        return  # ya iniciado
-
-    # Selección de dispositivo por nombre (hint) o default si no se encuentra
-    dev_index = _find_output_device(_DEVICE_NAME_HINT)
-    if dev_index is None:
-        print(f"[audio] ⚠️ No se encontró dispositivo con hint '{_DEVICE_NAME_HINT}'. Usando default.")
-    else:
-        dev_info = sd.query_devices(dev_index)
-        print(f"[audio] ✅ Usando dispositivo: {dev_info['name']} (idx={dev_index})")
-
-    # Seleccionar WASAPI en Windows si está disponible
-    try:
-        host_api_wasapi = None
-        for i, api in enumerate(sd.query_hostapis()):
-            if "wasapi" in api.get("name", "").lower():
-                host_api_wasapi = i
-                break
-        if host_api_wasapi is not None:
-            sd.default.hostapi = host_api_wasapi
-    except Exception:
-        pass  # si falla, sounddevice elige el mejor disponible
-
-    # Crear stream
-    _STREAM = sd.OutputStream(
-        device=dev_index if dev_index is not None else None,
-        samplerate=_SR,
-        channels=_CH,
-        dtype="float32",
-        callback=_audio_callback,
-        blocksize=_BLOCKSIZE,
-        latency=_LATENCY,   # hint, sounddevice puede ajustar
-        finished_callback=None,
-        dither_off=True,    # menos ruido
-    )
-    _STREAM.start()
-    print(f"[audio] stream iniciado @ {_SR} Hz, ch={_CH}, blocksize={_BLOCKSIZE}, latency={_LATENCY}")
-
-def write_audio(samples: np.ndarray) -> None:
-    """
-    Encola muestras float32 mono para reproducir en el callback.
-    No bloquea si la cola está llena: descarta silenciosamente (anti-flood).
-    """
-    try:
-        if samples is None:
+    # ---------- API pública ----------
+    def start(self):
+        """Inicia el stream WASAPI en modo baja latencia."""
+        if self._running:
             return
-        x = np.asarray(samples, dtype=np.float32).reshape(-1)
-        if x.size == 0:
-            return
-        # Suavizado de picos extremo antes de encolar
-        x = _soft_clip(x)
-        _QUEUE.put_nowait(x)
-    except queue.Full:
-        # Si la cola está llena, dejamos caer el chunk para mantener latencia baja.
-        pass
-    except Exception as e:
-        print(f"[audio] write_audio error: {e}")
 
-def close_audio_out() -> None:
-    """Detiene y cierra el stream de salida."""
-    global _STREAM
-    try:
-        if _STREAM is not None:
-            _STREAM.stop()
-            _STREAM.close()
-            _STREAM = None
-            # Vaciar la cola
-            while not _QUEUE.empty():
-                try:
-                    _QUEUE.get_nowait()
-                except Exception:
-                    break
-            print("[audio] stream cerrado.")
-    except Exception as e:
-        print(f"[audio] close_audio_out error: {e}")
+        try:
+            extra = sd.WasapiSettings(exclusive=False, low_latency=True)
+        except Exception:
+            # En algunos entornos la clase puede no estar disponible; continuar sin extra settings.
+            extra = None
+
+        try:
+            self._stream = sd.OutputStream(
+                device=self.device_index,
+                samplerate=self.samplerate,
+                channels=self.channels,
+                dtype="float32",
+                blocksize=self.blocksize,
+                latency="low",
+                callback=self._callback,
+                extra_settings=extra,
+            )
+            self._stream.start()
+            self._running = True
+            logger.info(
+                f"AudioPipe iniciado: sr={self.samplerate}, ch={self.channels}, "
+                f"blocksize={self.blocksize}, device_index={self.device_index}"
+            )
+        except Exception as e:
+            logger.error(f"Error iniciando OutputStream: {e}")
+            raise
+
+    def stop(self):
+        """Detiene y cierra el stream; vacía la cola."""
+        self._running = False
+        try:
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+        except Exception:
+            pass
+        finally:
+            self._stream = None
+        with self._queue_lock:
+            self._queue.clear()
+        logger.info("AudioPipe detenido.")
+
+    def put_pcm(self, pcm_mono_f32: np.ndarray):
+        """
+        Encola un buffer PCM mono float32 en rango [-1.0, 1.0].
+        Se recomienda ~100–200 ms por buffer para latencia baja y estabilidad.
+        """
+        if pcm_mono_f32 is None:
+            return
+        if not isinstance(pcm_mono_f32, np.ndarray):
+            pcm_mono_f32 = np.asarray(pcm_mono_f32, dtype=np.float32)
+        if pcm_mono_f32.dtype != np.float32:
+            pcm_mono_f32 = pcm_mono_f32.astype(np.float32, copy=False)
+
+        # Asegurar 1-D
+        pcm_mono_f32 = np.ravel(pcm_mono_f32).astype(np.float32, copy=False)
+
+        with self._queue_lock:
+            self._queue.append(pcm_mono_f32)
+
+    # ---------- Callback de audio ----------
+    def _callback(self, outdata, frames, time_info, status):
+        """
+        Callback de sounddevice. Debe escribir exactamente 'frames' muestras por canal.
+        Si no hay datos, rellena con silencio. Aplica soft-clip 0.98.
+        """
+        if status:
+            # Loguear xruns/underruns con rate limit
+            now = time.time()
+            if now - self._last_underflow_log > 2.0:  # 1 log / 2s
+                logger.warning(f"Audio status: {status}")
+                self._last_underflow_log = now
+
+        needed = frames
+        out = None
+
+        with self._queue_lock:
+            # Consumir de la cola hasta llenar 'frames'
+            chunks = []
+            while needed > 0 and self._queue:
+                buf = self._queue[0]
+                take = min(len(buf), needed)
+                if take == len(buf):
+                    chunks.append(buf)
+                    self._queue.popleft()
+                else:
+                    chunks.append(buf[:take])
+                    self._queue[0] = buf[take:]
+                needed -= take
+
+            if chunks:
+                out = np.concatenate(chunks, dtype=np.float32)
+
+        if out is None or len(out) < frames:
+            # Rellenar silencio si faltan muestras
+            if out is None:
+                out = np.zeros(frames, dtype=np.float32)
+            else:
+                pad = np.zeros(frames - len(out), dtype=np.float32)
+                out = np.concatenate([out, pad], dtype=np.float32)
+
+        # Soft-clip a 0.98
+        # Más suave que clip duro: y = tanh(gain*x); pero por simplicidad F1 usa clamp.
+        np.clip(out, -0.98, 0.98, out=out)
+
+        # Expandir a (frames, channels)
+        if self.channels == 1:
+            outdata[:, 0] = out
+        else:
+            # (No se usa en F1, pero dejamos duplicado simple)
+            for ch in range(self.channels):
+                outdata[:, ch] = out
+
+
+# ---------- Singleton perezoso ----------
+_instance_lock = threading.Lock()
+_instance: Optional[AudioPipe] = None
+
+
+def init_audio_output() -> AudioPipe:
+    """
+    Crea (si no existe) y retorna el singleton de AudioPipe.
+    No llama start(); eso lo hace app.py en startup.
+    """
+    global _instance
+    if _instance is not None:
+        return _instance
+    with _instance_lock:
+        if _instance is None:
+            _instance = AudioPipe(samplerate=SR, channels=CH, blocksize=480, device_name_substr=ENV_AUDIO_NAME)
+            logger.info("AudioPipe creado (lazy singleton).")
+    return _instance

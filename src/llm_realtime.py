@@ -1,192 +1,169 @@
+# -*- coding: utf-8 -*-
 """
-llm_realtime.py — Fase 1
-WS Realtime preferido + fallback HTTP streaming puro (sin SDK) con httpx.
+llm_realtime.py — Modo SSE-Only (rápido) + primera frase corta + párrafos word-safe
+- Evita el timeout del WebSocket Realtime y va directo a /v1/chat/completions con stream=True.
+- Instruye: "First sentence under 10 words. Then 2–3 short paragraphs."
+- Segmentación word-safe en modo "párrafo": emitir oraciones completas; si no hay fin aún,
+  solo cortar cuando buffer > MAX_CHARS y SIEMPRE en el último espacio (no partir palabras).
+- Nunca emite "." sueltos.
 
-- Primero intenta Realtime (WebSocket). Si no llega el primer delta en N s, cae a fallback.
-- Fallback: llama /v1/chat/completions con stream=true y parsea SSE "data:".
-- Emite trozos por oración para disparar TTS cuanto antes.
+Objetivo: bajar "texto→primer audio" quitando el penalti del WS, y sonar natural (sin staccato ni sílabas cortadas).
 """
 
 from __future__ import annotations
-import asyncio
-import json
+
 import os
 import re
-from typing import AsyncGenerator, Optional
+import json
+import time
+import asyncio
+import logging
+from typing import AsyncGenerator, Tuple, List
 
 import httpx
-import websockets
 
-REALTIME_URL = "wss://api.openai.com/v1/realtime"
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gpt-4o-mini")
+# ---------- Logging ----------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | llm_realtime | %(message)s",
+)
+logger = logging.getLogger("llm_realtime")
 
-_SENTENCE_SPLIT_RE = re.compile(r"([\.!\?]+[\)\]]?\s+|[\n\r]+)")
+# ---------- Tunables (modo párrafo) ----------
+FIRST_DELTA_LOG = True                 # loggear tiempo al primer delta
+MAX_CHARS = 360                        # si no hay fin de oración, cortar aquí
+MIN_CHARS_TO_EMIT = 140                # evita trozos demasiado cortos
+SENT_END = re.compile(r"(?<=[\.!?])\s+")  # fin de oración
 
-def _yieldable_chunks_from_buffer(buf: str, force: bool = False):
-    parts = []
-    last = 0
-    for m in _SENTENCE_SPLIT_RE.finditer(buf):
-        end = m.end()
-        seg = buf[last:end].strip()
-        if seg:
-            parts.append(seg)
-        last = end
-    if force:
-        tail = buf[last:].strip()
-        if tail:
-            parts.append(tail)
-        last = len(buf)
-    return parts, buf[last:]
+# ---------- Env helpers ----------
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return v.strip() if isinstance(v, str) else default
 
+def _cfg():
+    api_key = _env("OPENAI_API_KEY")
+    fallback_model = _env("FALLBACK_MODEL", "gpt-4o-mini")
+    sse_url = "https://api.openai.com/v1/chat/completions"
+    return api_key, fallback_model, sse_url
 
-# =================== Fallback HTTP (SSE) con httpx (async) ===================
+# ---------- Helpers de texto ----------
+def _append_with_period(text: str) -> str:
+    t = text.strip()
+    if not t:
+        return t
+    if t[-1] not in ".!?":
+        t += "."
+    return t
 
-async def _http_chat_stream_fallback_async(api_key: str, prompt: str) -> AsyncGenerator[str, None]:
+def _split_paragraph_mode(buffer: str) -> Tuple[List[str], str]:
     """
-    Streaming directo contra /v1/chat/completions (OpenAI) usando httpx.
-    Parseo de Server-Sent Events (líneas que empiezan con 'data: ').
+    Devuelve (ready_chunks, residue) SIN cortar palabras:
+      1) Si hay fin de oración [.?!], emitir oraciones completas.
+      2) Si no hay fin y buffer >= MAX_CHARS, cortar en ÚLTIMO ESPACIO antes del límite.
+      3) Si no, esperar más texto (no emitir).
+    Regla: nunca emitir '.' sueltos.
     """
-    url = "https://api.openai.com/v1/chat/completions"
+    ready: List[str] = []
+    residue = buffer
+
+    if not buffer:
+        return ready, residue
+
+    # (1) Oraciones completas
+    parts = SENT_END.split(buffer)
+    if len(parts) > 1:
+        *complete, residue = parts
+        for sent in complete:
+            s = sent.strip()
+            if not s:
+                continue
+            ready.append(_append_with_period(s))
+        return ready, residue
+
+    # (2) Longitud con corte en palabra
+    if len(buffer) >= MAX_CHARS:
+        cut = buffer[:MAX_CHARS]
+        sp = cut.rfind(" ")
+        if sp == -1:
+            sp = MAX_CHARS
+        head = buffer[:sp].rstrip()
+        tail = buffer[sp:].lstrip()
+        if len(head) >= MIN_CHARS_TO_EMIT:
+            ready.append(_append_with_period(head))
+            residue = tail
+        else:
+            residue = buffer
+        return ready, residue
+
+    return ready, residue
+
+# ---------- SSE rápido (sin WS) ----------
+async def _sse_stream(prompt: str) -> AsyncGenerator[str, None]:
+    api_key, model, sse_url = _cfg()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY no configurado.")
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    system = (
+        "First sentence under 10 words. Then 2–3 short paragraphs. "
+        "Be coherent, natural, and avoid mid-word breaks."
+    )
     payload = {
-        "model": FALLBACK_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "model": model,
         "stream": True,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
     }
 
-    timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", url, headers=headers, json=payload) as r:
-            r.raise_for_status()
-            text_buffer = ""
-            async for raw_line in r.aiter_lines():
-                if not raw_line:
+    buffer = ""
+    t0 = time.perf_counter()
+    first_delta = False
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        async with client.stream("POST", sse_url, headers=headers, json=payload) as r:
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data:"):
                     continue
-                if raw_line.startswith("data: "):
-                    data = raw_line[6:].strip()
-                    if data == "[DONE]":
-                        # flush final
-                        if text_buffer.strip():
-                            parts, text_buffer = _yieldable_chunks_from_buffer(text_buffer, force=True)
-                            for p in parts:
-                                yield p
-                        break
-                    try:
-                        obj = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    # Formato chat.completions stream
-                    try:
-                        delta = obj["choices"][0]["delta"].get("content")
-                    except Exception:
-                        delta = None
-                    if delta:
-                        text_buffer += delta
-                        parts, text_buffer = _yieldable_chunks_from_buffer(text_buffer, force=False)
-                        for p in parts:
-                            yield p
-
-
-# ========================= WebSocket Realtime (preferido) =========================
-
-async def _ws_recv_json(ws) -> Optional[dict]:
-    try:
-        msg = await ws.recv()
-        if not msg:
-            return None
-        if isinstance(msg, (bytes, bytearray)):
-            return None
-        return json.loads(msg)
-    except websockets.ConnectionClosed:
-        return None
-
-async def stream_completion(
-    api_key: str,
-    model: str,
-    prompt: str,
-    *,
-    connect_timeout: float = 10.0,
-    receive_timeout: float = 120.0,
-    first_delta_deadline: float = 3.0,  # si no hay delta en N s => fallback
-) -> AsyncGenerator[str, None]:
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY vacío")
-    if not model:
-        raise RuntimeError("REALTIME_MODEL vacío")
-
-    # ====== Intento por WebSocket Realtime ======
-    url = f"{REALTIME_URL}?model={model}"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "OpenAI-Beta": "realtime=v1",
-    }
-
-    try:
-        async with websockets.connect(
-            url,
-            extra_headers=headers,
-            subprotocols=["realtime"],      # importante
-            open_timeout=connect_timeout,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=8 * 1024 * 1024,
-        ) as ws:
-            # Configurar sesión sólo-texto
-            await ws.send(json.dumps({
-                "type": "session.update",
-                "session": {"modalities": ["text"], "instructions": "You are a streaming text assistant."},
-            }))
-            # Solicitar respuesta con nuestro prompt
-            await ws.send(json.dumps({
-                "type": "response.create",
-                "response": {"modalities": ["text"], "instructions": prompt},
-            }))
-
-            buf = ""
-            got_first = False
-            first_deadline = asyncio.get_event_loop().time() + first_delta_deadline
-
-            ws_task = asyncio.create_task(_ws_recv_json(ws))
-            while True:
-                if not got_first and asyncio.get_event_loop().time() > first_deadline:
-                    raise TimeoutError("No WS delta in deadline -> fallback")
-
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
                 try:
-                    event = await asyncio.wait_for(ws_task, timeout=receive_timeout)
-                except asyncio.TimeoutError:
-                    raise RuntimeError("Timeout recibiendo eventos Realtime")
+                    obj = json.loads(data_str)
+                except Exception:
+                    continue
 
-                ws_task = asyncio.create_task(_ws_recv_json(ws))
-                if not event:
-                    if buf.strip():
-                        parts, buf = _yieldable_chunks_from_buffer(buf, force=True)
-                        for p in parts:
-                            yield p
-                    break
+                choice = obj.get("choices", [{}])[0]
+                delta = choice.get("delta", {})
+                text_piece = delta.get("content", "")
+                if not text_piece:
+                    continue
 
-                et = event.get("type", "")
-                if et == "response.output_text.delta":
-                    delta = event.get("delta", "") or ""
-                    buf += delta
-                    got_first = True
-                    parts, buf = _yieldable_chunks_from_buffer(buf, force=False)
-                    for p in parts:
-                        yield p
-                elif et == "response.completed":
-                    if buf.strip():
-                        parts, buf = _yieldable_chunks_from_buffer(buf, force=True)
-                        for p in parts:
-                            yield p
-                    break
-                elif et in ("error", "response.error"):
-                    raise RuntimeError(f"Realtime error: {event.get('error', event)}")
+                if not first_delta and FIRST_DELTA_LOG:
+                    first_delta = True
+                    t1 = time.perf_counter()
+                    logger.info(f"SSE primer delta en {(t1 - t0)*1000:.1f} ms")
 
-        return  # éxito por WS
+                buffer += text_piece
+                ready, residue = _split_paragraph_mode(buffer)
+                for chunk in ready:
+                    yield chunk.strip()
+                buffer = residue
 
-    except Exception:
-        # ====== Fallback HTTP puro (no SDK) ======
-        async for chunk in _http_chat_stream_fallback_async(api_key=api_key, prompt=prompt):
-            yield chunk
+    tail = buffer.strip()
+    if tail:
+        yield _append_with_period(tail)
+
+# ---------- Public API ----------
+async def stream_text_chunks(prompt: str):
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return
+    # Camino único: SSE rápido (evitamos el timeout del WS hasta resolverlo en otra iteración)
+    async for chunk in _sse_stream(prompt):
+        yield chunk

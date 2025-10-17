@@ -1,125 +1,175 @@
+# -*- coding: utf-8 -*-
 """
-KURK – Phase 1
-FastAPI backend mínimo con endpoint /say.
+app.py — FastAPI backend (Phase 1)
+Endpoints:
+  - GET /health  → {"status":"ok","model":..., "sr":48000, "ch":1}
+  - POST /say    → {first_audio_ms, total_ms, chunk_count}
 
-Ejecución:
-(.venv) PS C:\AI_Workspace\Kurk> uvicorn src.app:app --host 127.0.0.1 --port 8000 --reload
+Pipeline:
+  text → (modes.preprocess) → OpenAI Realtime (partial tokens) → sentence chunks
+       → Coqui XTTS v2 (GPU) chunked 48k mono float32 → AudioPipe (VB-CABLE) → OBS
 
-Notas:
-- Backend expone /say para pruebas externas (POST con {"text": "..."}).
-- Orquesta: OpenAI Realtime (tokens parciales) -> Coqui XTTS -> CABLE Input.
-- Sin persistir audio (streaming en memoria).
-- Imprime métricas de latencia en logs (timestamps).
+Run (PowerShell, project root):
+  C:\AI_Workspace\KURK\.venv\Scripts\Activate.ps1
+  uvicorn src.app:app --host 127.0.0.1 --port 8000 --reload
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-import time
+from __future__ import annotations
+
 import os
+import time
+import logging
+from typing import Optional
 
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from fastapi import Body
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Carga variables de entorno
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
-VOICE_SAMPLE = os.getenv("VOICE_SAMPLE", "assets/voice.wav")
-AUDIO_SR = int(os.getenv("AUDIO_SAMPLE_RATE", "48000"))
-AUDIO_CH = int(os.getenv("AUDIO_CHANNELS", "1"))
-
-if not OPENAI_API_KEY:
-    raise RuntimeError("Falta OPENAI_API_KEY en .env")
-
-# ===== Imports internos (cada módulo aislado) =====
-from .llm_realtime import stream_completion  # async generator de tokens parciales
-from .tts_coqui import init_tts, stream_tts_from_text_chunks  # inicializa TTS y sintetiza en streaming
-from .audio_pipe import init_audio_out, close_audio_out        # gestiona salida a CABLE Input (VB-Audio)
-from .modes.neutral import preprocess_prompt                   # MODO NEUTRAL (1 archivo = 1 modo)
-
-app = FastAPI(title="KURK Phase 1 API", version="0.1.0")
-
-# CORS mínimo para pruebas locales
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+# --------- Logging ---------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | app | %(message)s",
 )
+logger = logging.getLogger("app")
+
+# --------- Safe imports (both package & local execution) ---------
+try:
+    # When running as "uvicorn src.app:app"
+    from src.audio_pipe import init_audio_output
+    from src.tts_coqui import init_tts
+    from src.llm_realtime import stream_text_chunks
+    from src import modes
+except Exception:
+    # Fallback for alternative run modes
+    from .audio_pipe import init_audio_output  # type: ignore
+    from .tts_coqui import init_tts  # type: ignore
+    from .llm_realtime import stream_text_chunks  # type: ignore
+    from . import modes  # type: ignore
+
+# --------- Env / constants ---------
+SR = int(os.getenv("SR", "48000"))
+CH = int(os.getenv("CHANNELS", "1"))
+REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
+
+# --------- FastAPI app ---------
+app = FastAPI(title="KURK F1 Backend", version="1.0.0")
+
+# shared singletons
+_audio = None
+_tts = None
+
 
 class SayIn(BaseModel):
     text: str
-    mode: Optional[str] = "neutral"  # placeholder (para Fase 2+)
+
 
 @app.on_event("startup")
-async def on_startup():
-    # Inicializa salida de audio y TTS una sola vez (GPU warmup)
-    print("[startup] inicializando audio y TTS…")
-    init_audio_out(sample_rate=AUDIO_SR, channels=AUDIO_CH)
-    init_tts(voice_sample_path=VOICE_SAMPLE, sample_rate=AUDIO_SR)
-    print("[startup] listo.")
+def _on_startup():
+    """Load .env, init audio + TTS, start audio output and warm up TTS."""
+    # .env first (so runtime env is available if not set by shell)
+    try:
+        if load_dotenv():
+            logger.info(".env loaded.")
+    except Exception as e:
+        logger.warning(f"No se pudo cargar .env automáticamente: {e}")
+
+    global _audio, _tts
+    # Init audio (but do not synth here)
+    _audio = init_audio_output()
+    _audio.start()
+
+    # Init TTS (includes warm-up internally)
+    _tts = init_tts()
+
+    logger.info(f"Startup OK. SR={SR}, CH={CH}, MODEL={REALTIME_MODEL}")
+
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    print("[shutdown] cerrando audio…")
+def _on_shutdown():
     try:
-        close_audio_out()
-    except Exception as e:
-        print(f"[shutdown] warning al cerrar audio: {e}")
+        if _audio:
+            _audio.stop()
+    except Exception:
+        pass
+
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "model": REALTIME_MODEL, "sr": AUDIO_SR, "ch": AUDIO_CH}
+def health():
+    """Simple readiness check."""
+    return {
+        "status": "ok",
+        "model": REALTIME_MODEL,
+        "sr": SR,
+        "ch": CH,
+    }
+
 
 @app.post("/say")
-async def say(payload: SayIn):
+async def say(payload: SayIn = Body(...)):
     """
-    Recibe texto, obtiene respuesta con tokens parciales desde OpenAI Realtime
-    y sintetiza en voz clonada con Coqui XTTS v2 en streaming hacia CABLE Input.
+    Accepts {"text": "..."} and streams LLM → TTS in-process, returning latency metrics.
+    Guardrails:
+      - No audio persisted to disk — buffers only.
+      - Sentence-level chunking triggers TTS enqueue ASAP.
     """
-    user_text = payload.text.strip()
-    if not user_text:
-        raise HTTPException(status_code=400, detail="text vacío")
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
 
-    # Fase 1: no repetir input del usuario (sin /echo)
-    prompt = preprocess_prompt(user_text)
+    # Prepare prompt (neutral, concise, English, no echo)
+    prompt = modes.preprocess(text)
 
-    t0 = time.perf_counter()
-    print(f"[/say] ⏱️ start ts={t0:.6f} prompt='{prompt[:120]}'…")
+    # Timings
+    t0_recv = time.perf_counter()
+    t1_first_delta: Optional[float] = None
+    t2_first_audio: Optional[float] = None
+    chunk_count = 0
 
-    tokens_count = 0
-    first_audio_ts: Optional[float] = None
-
+    # Stream sentences from LLM and enqueue to TTS
     try:
-        async for chunk in stream_completion(
-            api_key=OPENAI_API_KEY,
-            model=REALTIME_MODEL,
-            prompt=prompt
-        ):
-            if not chunk:
-                continue
-            tokens_count += 1
-
-            if first_audio_ts is None:
-                first_audio_ts = time.perf_counter()
-
-            # TTS en streaming con prebuffer ~100–200 ms y control de backpressure
-            await stream_tts_from_text_chunks(chunk)
-
+        async for sentence in stream_text_chunks(prompt):
+            if sentence:
+                if t1_first_delta is None:
+                    t1_first_delta = time.perf_counter()
+                # TTS synth + enqueue (chunked internally)
+                _tts.enqueue(sentence)
+                chunk_count += 1
+                if t2_first_audio is None:
+                    # Approximate "first audible" as first enqueue time
+                    t2_first_audio = time.perf_counter()
     except Exception as e:
-        print(f"[ERROR][/say] {e}")
-        raise HTTPException(status_code=500, detail=f"Fallo en pipeline: {e}")
+        logger.error(f"/say pipeline error: {e}")
+        raise HTTPException(status_code=502, detail=f"llm/tts pipeline failed: {e}")
 
-    t_end = time.perf_counter()
-    total = (t_end - t0) * 1000.0
-    first_audio_ms = ((first_audio_ts - t0) * 1000.0) if first_audio_ts else None
+    t3_done = time.perf_counter()
 
-    print(f"[/say] ✅ done tokens={tokens_count} total_ms={total:.1f} first_audio_ms={first_audio_ms:.1f if first_audio_ms else -1}")
+    # Metrics
+    def ms(a: Optional[float], b: Optional[float]) -> Optional[float]:
+        if a is None or b is None:
+            return None
+        return (b - a) * 1000.0
 
-    return {
-        "ok": True,
-        "tokens": tokens_count,
-        "latency_ms": round(total, 1),
-        "first_audio_ms": round(first_audio_ms, 1) if first_audio_ms else None
+    metrics = {
+        "t0_recv": t0_recv,
+        "t1_first_delta": t1_first_delta,
+        "t2_first_audio": t2_first_audio,
+        "t3_done": t3_done,
+        "llm_to_first_delta_ms": ms(t0_recv, t1_first_delta),
+        "first_audio_ms": ms(t0_recv, t2_first_audio),
+        "total_ms": ms(t0_recv, t3_done),
+        "chunk_count": chunk_count,
     }
+
+    # Log compact
+    logger.info(
+        "metrics | first_delta_ms=%.1f first_audio_ms=%.1f total_ms=%.1f chunks=%d",
+        metrics["llm_to_first_delta_ms"] or -1.0,
+        metrics["first_audio_ms"] or -1.0,
+        metrics["total_ms"] or -1.0,
+        chunk_count,
+    )
+
+    return metrics
