@@ -5,6 +5,7 @@ WASAPI output → VB-Audio CABLE Input (48 kHz, mono), low-latency callback + FI
 - Float32 pipeline, sin escritura a disco.
 - Soft-clip 0.98 para evitar clipping en OBS.
 - Selección de dispositivo por substring (AUDIO_DEVICE_NAME), fallback al default.
+- Drenaje de cola: pending_seconds() y wait_empty(timeout_s) para respuestas largas.
 
 Env (.env):
   AUDIO_DEVICE_NAME=CABLE Input (VB-Audio Virtual Cable)
@@ -24,7 +25,7 @@ import time
 import logging
 import threading
 from collections import deque
-from typing import Optional
+from typing import Optional, Deque
 
 import numpy as np
 import sounddevice as sd
@@ -77,6 +78,8 @@ class AudioPipe:
     Consumidor de buffers PCM float32 mono a 48 kHz (por defecto), con callback en WASAPI.
     - put_pcm(): encola buffers (1-D float32 en [-1.0, 1.0], mono).
     - start()/stop(): controla el stream.
+    - pending_seconds(): segundos pendientes en cola.
+    - wait_empty(timeout_s): bloquea hasta drenar la cola o vencer el timeout.
     """
 
     def __init__(self, samplerate: int = SR, channels: int = CH, blocksize: int = 480,
@@ -103,14 +106,18 @@ class AudioPipe:
             logger.info(f"Usando dispositivo de salida index={self.device_index} (match '{device_name_substr}').")
 
         # FIFO de chunks (cada chunk es np.ndarray float32 mono)
-        self._queue = deque()
+        self._queue: Deque[np.ndarray] = deque()
         self._queue_lock = threading.Lock()
-
-        self._stream: Optional[sd.OutputStream] = None
-        self._running = False
+        self._queue_frames = 0  # total de muestras en cola
 
         # Para rate-limiting de logs de underflow
         self._last_underflow_log = 0.0
+
+        # Condición para wait_empty()
+        self._empty_cv = threading.Condition(self._queue_lock)
+
+        self._stream: Optional[sd.OutputStream] = None
+        self._running = False
 
     # ---------- API pública ----------
     def start(self):
@@ -158,6 +165,8 @@ class AudioPipe:
             self._stream = None
         with self._queue_lock:
             self._queue.clear()
+            self._queue_frames = 0
+            self._empty_cv.notify_all()
         logger.info("AudioPipe detenido.")
 
     def put_pcm(self, pcm_mono_f32: np.ndarray):
@@ -177,6 +186,26 @@ class AudioPipe:
 
         with self._queue_lock:
             self._queue.append(pcm_mono_f32)
+            self._queue_frames += len(pcm_mono_f32)
+
+    def pending_seconds(self) -> float:
+        """Segundos de audio pendientes en la cola."""
+        with self._queue_lock:
+            return float(self._queue_frames) / float(self.samplerate)
+
+    def wait_empty(self, timeout_s: float = 60.0) -> bool:
+        """
+        Bloquea hasta que la cola quede completamente vacía o venza el timeout.
+        Devuelve True si se vació, False si se agotó el tiempo.
+        """
+        end = time.time() + max(0.0, float(timeout_s))
+        with self._queue_lock:
+            while self._queue_frames > 0:
+                remaining = end - time.time()
+                if remaining <= 0:
+                    return False
+                self._empty_cv.wait(timeout=remaining)
+            return True
 
     # ---------- Callback de audio ----------
     def _callback(self, outdata, frames, time_info, status):
@@ -207,9 +236,14 @@ class AudioPipe:
                     chunks.append(buf[:take])
                     self._queue[0] = buf[take:]
                 needed -= take
+                self._queue_frames -= take
 
-            if chunks:
-                out = np.concatenate(chunks, dtype=np.float32)
+            # si la cola quedó vacía, notificar a wait_empty()
+            if self._queue_frames == 0:
+                self._empty_cv.notify_all()
+
+        if out is None and chunks:
+            out = np.concatenate(chunks, dtype=np.float32)
 
         if out is None or len(out) < frames:
             # Rellenar silencio si faltan muestras
@@ -220,14 +254,12 @@ class AudioPipe:
                 out = np.concatenate([out, pad], dtype=np.float32)
 
         # Soft-clip a 0.98
-        # Más suave que clip duro: y = tanh(gain*x); pero por simplicidad F1 usa clamp.
         np.clip(out, -0.98, 0.98, out=out)
 
         # Expandir a (frames, channels)
         if self.channels == 1:
             outdata[:, 0] = out
         else:
-            # (No se usa en F1, pero dejamos duplicado simple)
             for ch in range(self.channels):
                 outdata[:, ch] = out
 
