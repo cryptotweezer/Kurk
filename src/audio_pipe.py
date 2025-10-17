@@ -1,22 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 audio_pipe.py
-WASAPI output → VB-Audio CABLE Input (48 kHz, mono), low-latency callback + FIFO.
+WASAPI output → VB-Audio CABLE Input (48 kHz, mono/estéreo), low-latency callback + FIFO.
 - Float32 pipeline, sin escritura a disco.
 - Soft-clip 0.98 para evitar clipping en OBS.
 - Selección de dispositivo por substring (AUDIO_DEVICE_NAME), fallback al default.
 - Drenaje de cola: pending_seconds() y wait_empty(timeout_s) para respuestas largas.
-- Logging de underruns para diagnosticar distorsión.
-
-Env (.env):
-  AUDIO_DEVICE_NAME=CABLE Input (VB-Audio Virtual Cable)
-  SR=48000
-  CHANNELS=1
-  LOG_LEVEL=INFO
-
-API:
-  init_audio_output() -> AudioPipe
-  audio = init_audio_output(); audio.start(); audio.put_pcm(np.ndarray[float32, mono])
+- Fallback WASAPI: si extra_settings falla (PaError -9984), reintenta sin extra_settings.
+- Menos underruns: blocksize=960 (~20 ms @ 48 kHz) por defecto.
+- Sanitiza NaN/Inf al encolar.
 """
 
 from __future__ import annotations
@@ -26,17 +18,17 @@ import time
 import logging
 import threading
 from collections import deque
-from typing import Optional, Deque
+from typing import Optional, Deque, List
 
 import numpy as np
 import sounddevice as sd
-
 
 # ---------- Config ----------
 ENV_AUDIO_NAME = os.getenv("AUDIO_DEVICE_NAME", "CABLE Input")
 SR = int(os.getenv("SR", "48000"))
 CH = int(os.getenv("CHANNELS", "1"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+BLOCKSIZE = int(os.getenv("AUDIO_BLOCKSIZE", "960"))  # ~20 ms @ 48k
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -47,10 +39,7 @@ logger = logging.getLogger("audio_pipe")
 
 # ---------- Utilidades de dispositivo ----------
 def _find_output_device_index(name_substr: str) -> Optional[int]:
-    """
-    Busca un dispositivo de salida cuyo nombre contenga 'name_substr' (case-insensitive).
-    Retorna el índice de 'sounddevice' o None si no encuentra.
-    """
+    """Busca un dispositivo de salida cuyo nombre contenga 'name_substr' (case-insensitive)."""
     try:
         devices = sd.query_devices()
     except Exception as e:
@@ -58,34 +47,31 @@ def _find_output_device_index(name_substr: str) -> Optional[int]:
         return None
 
     name_substr_low = (name_substr or "").lower()
-    best = None
     for idx, dev in enumerate(devices):
         try:
             if dev.get("max_output_channels", 0) <= 0:
                 continue
             name = str(dev.get("name", ""))
             if name_substr_low in name.lower():
-                best = idx
-                break
+                return idx
         except Exception:
             continue
-
-    return best
+    return None
 
 
 # ---------- Clase principal ----------
 class AudioPipe:
     """
-    Consumidor de buffers PCM float32 mono a 48 kHz (por defecto), con callback en WASAPI.
-    - put_pcm(): encola buffers (1-D float32 en [-1.0, 1.0], mono).
+    Consumidor de buffers PCM float32 mono (o estéreo duplicado) a 48 kHz, con callback en WASAPI.
+    - put_pcm(): encola buffers (1-D float32 en [-1.0, 1.0]).
     - start()/stop(): controla el stream.
     - pending_seconds(): segundos pendientes en cola.
     - wait_empty(timeout_s): bloquea hasta drenar la cola o vencer el timeout.
     """
 
-    def __init__(self, samplerate: int = SR, channels: int = CH, blocksize: int = 480,
-                 device_name_substr: str = ENV_AUDIO_NAME):
-        assert channels == 1, "Fase 1 requiere mono (CHANNELS=1)."
+    def __init__(self, samplerate: int = SR, channels: int = CH,
+                 blocksize: int = BLOCKSIZE, device_name_substr: str = ENV_AUDIO_NAME):
+        assert channels in (1, 2), "Fase 1 soporta mono o estéreo (duplica mono a L/R)."
 
         self.samplerate = int(samplerate)
         self.channels = int(channels)
@@ -101,7 +87,7 @@ class AudioPipe:
             self.device_index = default_out
             logger.warning(
                 f"No se encontró dispositivo que contenga '{device_name_substr}'. "
-                f"Se usará el dispositivo de salida por defecto: {self.device_index}"
+                f"Se usará salida por defecto: {self.device_index}"
             )
         else:
             logger.info(f"Usando dispositivo de salida index={self.device_index} (match '{device_name_substr}').")
@@ -111,7 +97,7 @@ class AudioPipe:
         self._queue_lock = threading.Lock()
         self._queue_frames = 0  # total de muestras en cola
 
-        # Para rate-limiting de logs de underflow y low buffer
+        # Rate-limit logs
         self._last_underflow_log = 0.0
         self._last_lowbuffer_log = 0.0
 
@@ -123,18 +109,19 @@ class AudioPipe:
 
     # ---------- API pública ----------
     def start(self):
-        """Inicia el stream WASAPI en modo baja latencia."""
+        """Inicia el stream; si WASAPI extra_settings falla, reintenta sin ellos."""
         if self._running:
             return
 
+        # Intento con WASAPI extra_settings (si disponible)
+        extra = None
         try:
-            extra = sd.WasapiSettings(exclusive=False, low_latency=True)
+            extra = sd.WasapiSettings(exclusive=False)
         except Exception:
-            # En algunos entornos la clase puede no estar disponible; continuar sin extra settings.
             extra = None
 
-        try:
-            self._stream = sd.OutputStream(
+        def _open_stream(extra_settings):
+            return sd.OutputStream(
                 device=self.device_index,
                 samplerate=self.samplerate,
                 channels=self.channels,
@@ -142,16 +129,33 @@ class AudioPipe:
                 blocksize=self.blocksize,
                 latency="low",
                 callback=self._callback,
-                extra_settings=extra,
+                extra_settings=extra_settings,
             )
+
+        # 1) Con extra_settings
+        try:
+            self._stream = _open_stream(extra)
             self._stream.start()
             self._running = True
             logger.info(
-                f"AudioPipe iniciado: sr={self.samplerate}, ch={self.channels}, "
+                f"AudioPipe iniciado (con extra={extra is not None}): sr={self.samplerate}, ch={self.channels}, "
                 f"blocksize={self.blocksize}, device_index={self.device_index}"
             )
-        except Exception as e:
-            logger.error(f"Error iniciando OutputStream: {e}")
+            return
+        except Exception as e1:
+            logger.warning(f"WASAPI extra_settings falló ({e1}); reintentando sin extra_settings...")
+
+        # 2) Sin extra_settings
+        try:
+            self._stream = _open_stream(None)
+            self._stream.start()
+            self._running = True
+            logger.info(
+                f"AudioPipe iniciado (sin extra_settings): sr={self.samplerate}, ch={self.channels}, "
+                f"blocksize={self.blocksize}, device_index={self.device_index}"
+            )
+        except Exception as e2:
+            logger.error(f"Error iniciando OutputStream sin extra_settings: {e2}")
             raise
 
     def stop(self):
@@ -183,8 +187,9 @@ class AudioPipe:
         if pcm_mono_f32.dtype != np.float32:
             pcm_mono_f32 = pcm_mono_f32.astype(np.float32, copy=False)
 
-        # Asegurar 1-D
+        # Asegurar 1-D y sanitizar (evita NaN/Inf -> distorsión/callback error)
         pcm_mono_f32 = np.ravel(pcm_mono_f32).astype(np.float32, copy=False)
+        pcm_mono_f32 = np.nan_to_num(pcm_mono_f32, nan=0.0, posinf=0.0, neginf=0.0)
 
         with self._queue_lock:
             self._queue.append(pcm_mono_f32)
@@ -224,22 +229,21 @@ class AudioPipe:
                 self._last_underflow_log = now
 
         needed = frames
-        out = None
+        out: Optional[np.ndarray] = None
+        chunks: List[np.ndarray] = []
 
         with self._queue_lock:
-            # ✅ NUEVO: Detectar buffer bajo (< 2× blocksize = ~20 ms @ 48kHz)
+            # Detectar buffer bajo (< 2× blocksize)
             if self._queue_frames > 0 and self._queue_frames < (self.blocksize * 2):
                 now = time.time()
-                if now - self._last_lowbuffer_log > 2.0:  # 1 log / 2s
+                if now - self._last_lowbuffer_log > 2.0:
                     pending_ms = (self._queue_frames / self.samplerate) * 1000.0
                     logger.warning(
-                        f"🔴 LOW BUFFER: {self._queue_frames} frames ({pending_ms:.1f} ms) — "
-                        f"posible underrun inminente"
+                        f"🔴 LOW BUFFER: {self._queue_frames} frames ({pending_ms:.1f} ms) — posible underrun inminente"
                     )
                     self._last_lowbuffer_log = now
 
             # Consumir de la cola hasta llenar 'frames'
-            chunks = []
             while needed > 0 and self._queue:
                 buf = self._queue[0]
                 take = min(len(buf), needed)
@@ -256,8 +260,9 @@ class AudioPipe:
             if self._queue_frames == 0:
                 self._empty_cv.notify_all()
 
-        if out is None and chunks:
-            out = np.concatenate(chunks, dtype=np.float32)
+        if chunks:
+            # FIX: numpy.concatenate no acepta dtype=..., convertir después
+            out = np.concatenate(chunks).astype(np.float32, copy=False)
 
         if out is None or len(out) < frames:
             # Rellenar silencio si faltan muestras
@@ -265,7 +270,7 @@ class AudioPipe:
                 out = np.zeros(frames, dtype=np.float32)
             else:
                 pad = np.zeros(frames - len(out), dtype=np.float32)
-                out = np.concatenate([out, pad], dtype=np.float32)
+                out = np.concatenate([out, pad]).astype(np.float32, copy=False)
 
         # Soft-clip a 0.98
         np.clip(out, -0.98, 0.98, out=out)
@@ -274,8 +279,9 @@ class AudioPipe:
         if self.channels == 1:
             outdata[:, 0] = out
         else:
-            for ch in range(self.channels):
-                outdata[:, ch] = out
+            # Duplicar mono a estéreo
+            outdata[:, 0] = out
+            outdata[:, 1] = out
 
 
 # ---------- Singleton perezoso ----------
@@ -293,6 +299,6 @@ def init_audio_output() -> AudioPipe:
         return _instance
     with _instance_lock:
         if _instance is None:
-            _instance = AudioPipe(samplerate=SR, channels=CH, blocksize=480, device_name_substr=ENV_AUDIO_NAME)
+            _instance = AudioPipe(samplerate=SR, channels=CH, blocksize=BLOCKSIZE, device_name_substr=ENV_AUDIO_NAME)
             logger.info("AudioPipe creado (lazy singleton).")
     return _instance

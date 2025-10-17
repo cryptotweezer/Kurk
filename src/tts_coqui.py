@@ -2,12 +2,13 @@
 """
 tts_coqui.py
 Coqui XTTS v2 (GPU) → síntesis en memoria, mono float32 @ 48 kHz, sin escribir a disco.
-Mejoras F1:
-- enqueue() NO bloquea: se encola texto y un worker background sintetiza y alimenta audio_pipe.
-- Lookahead: el worker mantiene cola de PCM siempre adelantada para evitar underflow/gaps.
-- Crossfade de 50 ms entre frases para empalmes naturales (sin cortes audibles).
-- Trimea silencios al inicio/final de cada frase para evitar gaps.
-- Usa assets/voice.wav si existe (clon), si no, speaker por defecto (configurable).
+
+Mejoras F1.3 (fluidez):
+- Prebuffer inicial (~500 ms) antes del primer put_pcm() para evitar LOW BUFFER al arranque.
+- Chunks de ~200 ms para mejor prosodia y menos uniones audibles.
+- Crossfade moderado (25 ms) entre frases.
+- Trim de silencios en cada frase.
+- Sanitizado de PCM y normalización de pico.
 """
 
 from __future__ import annotations
@@ -43,13 +44,19 @@ VOICE_WAV = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "
 
 # XTTS genera ~24 kHz; escalamos a 48 kHz.
 XTTS_NATIVE_SR = 24000
-CHUNK_SECONDS = 0.10                   # ~100 ms por buffer para salida fluida
+
+# ---- Parámetros de fluidez ----
+CHUNK_SECONDS = float(os.getenv("TTS_CHUNK_SECONDS", "0.20"))    # ~200 ms
 TARGET_FRAMES_PER_CHUNK = int(SR * CHUNK_SECONDS)
-XF_MS = 50                             # crossfade entre frases (ms) — AUMENTADO de 10 a 50
-XF_SAMPLES = int(SR * XF_MS / 1000.0)  # ~2400 muestras @ 48k
+
+XF_MS = int(os.getenv("TTS_CROSSFADE_MS", "25"))                 # 25 ms
+XF_SAMPLES = int(SR * XF_MS / 1000.0)                            # ~1200 muestras @ 48k
+
+PREBUFFER_SECONDS = float(os.getenv("TTS_PREBUFFER_SECONDS", "0.50"))  # 500 ms
+PREBUFFER_FRAMES = int(SR * PREBUFFER_SECONDS)
 
 # Threshold para detectar silencio (valor absoluto)
-SILENCE_THRESHOLD = 0.01
+SILENCE_THRESHOLD = float(os.getenv("TTS_SILENCE_THRESHOLD", "0.01"))
 
 # ---------- Utils ----------
 def _to_mono(x: np.ndarray) -> np.ndarray:
@@ -67,6 +74,9 @@ def _normalize_peak(x: np.ndarray, peak: float = 0.97) -> np.ndarray:
         x = (x / m) * peak
     return x.astype(np.float32, copy=False)
 
+def _sanitize(x: np.ndarray) -> np.ndarray:
+    return np.nan_to_num(x.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+
 def _resample_numpy(wave: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     wav_t = torch.from_numpy(wave).to(device=device, dtype=torch.float32)
@@ -77,31 +87,20 @@ def _resample_numpy(wave: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return resampled
 
 def _trim_silence(wave: np.ndarray, threshold: float = SILENCE_THRESHOLD) -> np.ndarray:
-    """
-    Recorta silencios al inicio y final del audio.
-    Silencio = samples con abs(value) < threshold.
-    """
     if len(wave) == 0:
         return wave
-    
-    # Encontrar primer sample NO silencioso
     start = 0
     for i in range(len(wave)):
         if abs(wave[i]) >= threshold:
             start = i
             break
-    
-    # Encontrar último sample NO silencioso
     end = len(wave)
     for i in range(len(wave) - 1, -1, -1):
         if abs(wave[i]) >= threshold:
             end = i + 1
             break
-    
     if start >= end:
-        # Todo es silencio
         return np.zeros(0, dtype=np.float32)
-    
     return wave[start:end]
 
 def _chunkify(wave: np.ndarray, frames_per_chunk: int) -> List[np.ndarray]:
@@ -117,20 +116,15 @@ def _chunkify(wave: np.ndarray, frames_per_chunk: int) -> List[np.ndarray]:
     return out
 
 def _crossfade_join(prev_tail: Optional[np.ndarray], current: np.ndarray) -> np.ndarray:
-    """
-    Mezcla 50 ms del inicio de 'current' con el tail de 'prev' para suavizar empalme.
-    Si no hay prev_tail suficiente, retorna current.
-    """
+    """Mezcla 25 ms del inicio de 'current' con el tail de 'prev' para suavizar empalme."""
     if prev_tail is None or len(prev_tail) < XF_SAMPLES or len(current) <= 0:
         return current
     L = min(XF_SAMPLES, len(prev_tail), len(current))
     fade_out = np.linspace(1.0, 0.0, L, dtype=np.float32)
     fade_in  = 1.0 - fade_out
     mixed = prev_tail[-L:] * fade_out + current[:L] * fade_in
-    out = np.concatenate([mixed, current[L:]], dtype=np.float32)
-    # Limitar pico por seguridad
-    out = _normalize_peak(out, peak=0.97)
-    return out
+    out = np.concatenate([mixed, current[L:]]).astype(np.float32, copy=False)
+    return _normalize_peak(out, peak=0.97)
 
 # ---------- Clase principal ----------
 class TTSCoqui:
@@ -174,10 +168,7 @@ class TTSCoqui:
 
     # ---------- API pública ----------
     def enqueue(self, text_chunk: str):
-        """
-        Encola texto para síntesis (no bloquea).
-        Un worker background sintetiza y va alimentando audio_pipe con lookahead.
-        """
+        """Encola texto para síntesis (no bloquea)."""
         t = (text_chunk or "").strip()
         if not t:
             return
@@ -201,9 +192,7 @@ class TTSCoqui:
         logger.info("TTS worker detenido.")
 
     def _synthesize_xtts(self, text: str) -> np.ndarray:
-        """
-        XTTS v2 a ~24 kHz, mono float32 [-1,1].
-        """
+        """XTTS v2 a ~24 kHz, mono float32 [-1,1]."""
         if not text or not text.strip():
             return np.zeros(0, dtype=np.float32)
         kwargs: Dict[str, Any] = {"text": text.strip(), "language": "en", "split_sentences": False}
@@ -230,9 +219,11 @@ class TTSCoqui:
     def _worker_loop(self):
         """
         Toma textos de la cola, sintetiza, aplica trim de silencios, crossfade con la frase anterior,
-        trocea en ~100 ms y alimenta audio_pipe sin bloquear la UI.
-        Mantiene la cola de PCM por delante para evitar underflow.
+        trocea en ~200 ms y alimenta audio_pipe. Realiza prebuffer inicial de ~500 ms.
         """
+        prebuffer_done = False
+        prebuffer_accum: List[np.ndarray] = []
+
         while not self._stop.is_set():
             text = None
             with self._q_lock:
@@ -247,27 +238,42 @@ class TTSCoqui:
             if wav_24k.size == 0:
                 continue
 
-            # 2) Resample → 48k y normalizar
+            # 2) Resample → 48k, sanitizar y normalizar
             wav_48k = _resample_numpy(wav_24k, XTTS_NATIVE_SR, SR)
-            wav_48k = _normalize_peak(wav_48k, peak=0.97)
+            wav_48k = _sanitize(_normalize_peak(wav_48k, peak=0.97))
 
-            # 3) ✅ NUEVO: Trimear silencios al inicio/final
+            # 3) Trim silencios
             wav_48k = _trim_silence(wav_48k, threshold=SILENCE_THRESHOLD)
             if len(wav_48k) == 0:
                 logger.warning(f"Frase completamente silenciosa después de trim: '{text[:60]}'")
                 continue
 
-            # 4) Crossfade con la frase anterior (50 ms)
+            # 4) Crossfade con la frase anterior (25 ms)
             wav_48k = _crossfade_join(self._prev_tail, wav_48k)
             self._prev_tail = wav_48k[-XF_SAMPLES:].copy() if len(wav_48k) >= XF_SAMPLES else wav_48k[-len(wav_48k):].copy()
 
-            # 5) Trocear y alimentar audio
+            # 5) Trocear
             chunks = _chunkify(wav_48k, TARGET_FRAMES_PER_CHUNK)
             logger.info(f"TTS enqueue (worker): '{text[:60].strip()}...' chunks={len(chunks)}")
+
+            # 6) Prebuffer inicial (~500 ms) antes de la primera entrega
+            if not prebuffer_done:
+                prebuffer_accum.extend(chunks)
+                acc_frames = sum(len(c) for c in prebuffer_accum)
+                if acc_frames < PREBUFFER_FRAMES:
+                    # Aún no suficiente; esperar siguiente frase
+                    continue
+                # Soltar el prebuffer y marcar done
+                for c in prebuffer_accum:
+                    self.audio.put_pcm(c)
+                prebuffer_accum.clear()
+                prebuffer_done = True
+                continue  # siguiente iteración para no duplicar envío
+
+            # 7) Entrega normal (post-prebuffer)
             for c in chunks:
                 self.audio.put_pcm(c)
 
-    # ---------- Context manager (si hiciera falta limpiar) ----------
     def __del__(self):
         try:
             self._stop_worker()
