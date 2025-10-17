@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import time
+import asyncio
 import logging
 from typing import Optional
 
@@ -114,6 +115,7 @@ async def say(payload: SayIn = Body(...)):
     Guardrails:
       - No audio persisted to disk — buffers only.
       - Sentence-level chunking triggers TTS enqueue ASAP.
+      - Waits for audio queue to drain before returning (prevents cut-off in long responses).
     """
     text = (payload.text or "").strip()
     if not text:
@@ -143,6 +145,16 @@ async def say(payload: SayIn = Body(...)):
     except Exception as e:
         logger.error(f"/say pipeline error: {e}")
         raise HTTPException(status_code=502, detail=f"llm/tts pipeline failed: {e}")
+
+    # ✅ NUEVO: Esperar a que la cola de audio se drene completamente
+    # Esto evita que respuestas largas se corten antes de terminar
+    logger.info("Esperando drenaje completo de audio...")
+    try:
+        drained = await asyncio.to_thread(_audio.wait_empty, timeout_s=60.0)
+        if not drained:
+            logger.warning("Audio drain timeout (60s) — respuesta puede estar incompleta")
+    except Exception as e:
+        logger.error(f"Error en wait_empty: {e}")
 
     t3_done = time.perf_counter()
 

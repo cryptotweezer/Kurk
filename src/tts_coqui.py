@@ -5,7 +5,8 @@ Coqui XTTS v2 (GPU) → síntesis en memoria, mono float32 @ 48 kHz, sin escribi
 Mejoras F1:
 - enqueue() NO bloquea: se encola texto y un worker background sintetiza y alimenta audio_pipe.
 - Lookahead: el worker mantiene cola de PCM siempre adelantada para evitar underflow/gaps.
-- Crossfade de 10 ms entre frases para empalmes naturales (sin cortes audibles).
+- Crossfade de 50 ms entre frases para empalmes naturales (sin cortes audibles).
+- Trimea silencios al inicio/final de cada frase para evitar gaps.
 - Usa assets/voice.wav si existe (clon), si no, speaker por defecto (configurable).
 """
 
@@ -44,8 +45,11 @@ VOICE_WAV = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "
 XTTS_NATIVE_SR = 24000
 CHUNK_SECONDS = 0.10                   # ~100 ms por buffer para salida fluida
 TARGET_FRAMES_PER_CHUNK = int(SR * CHUNK_SECONDS)
-XF_MS = 10                             # crossfade entre frases (ms)
-XF_SAMPLES = int(SR * XF_MS / 1000.0)  # ~480 muestras @ 48k
+XF_MS = 50                             # crossfade entre frases (ms) — AUMENTADO de 10 a 50
+XF_SAMPLES = int(SR * XF_MS / 1000.0)  # ~2400 muestras @ 48k
+
+# Threshold para detectar silencio (valor absoluto)
+SILENCE_THRESHOLD = 0.01
 
 # ---------- Utils ----------
 def _to_mono(x: np.ndarray) -> np.ndarray:
@@ -72,6 +76,34 @@ def _resample_numpy(wave: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     resampled = resampled.squeeze(0).detach().to("cpu").numpy().astype(np.float32, copy=False)
     return resampled
 
+def _trim_silence(wave: np.ndarray, threshold: float = SILENCE_THRESHOLD) -> np.ndarray:
+    """
+    Recorta silencios al inicio y final del audio.
+    Silencio = samples con abs(value) < threshold.
+    """
+    if len(wave) == 0:
+        return wave
+    
+    # Encontrar primer sample NO silencioso
+    start = 0
+    for i in range(len(wave)):
+        if abs(wave[i]) >= threshold:
+            start = i
+            break
+    
+    # Encontrar último sample NO silencioso
+    end = len(wave)
+    for i in range(len(wave) - 1, -1, -1):
+        if abs(wave[i]) >= threshold:
+            end = i + 1
+            break
+    
+    if start >= end:
+        # Todo es silencio
+        return np.zeros(0, dtype=np.float32)
+    
+    return wave[start:end]
+
 def _chunkify(wave: np.ndarray, frames_per_chunk: int) -> List[np.ndarray]:
     if len(wave) == 0:
         return []
@@ -86,7 +118,7 @@ def _chunkify(wave: np.ndarray, frames_per_chunk: int) -> List[np.ndarray]:
 
 def _crossfade_join(prev_tail: Optional[np.ndarray], current: np.ndarray) -> np.ndarray:
     """
-    Mezcla 10 ms del inicio de 'current' con el tail de 'prev' para suavizar empalme.
+    Mezcla 50 ms del inicio de 'current' con el tail de 'prev' para suavizar empalme.
     Si no hay prev_tail suficiente, retorna current.
     """
     if prev_tail is None or len(prev_tail) < XF_SAMPLES or len(current) <= 0:
@@ -197,7 +229,7 @@ class TTSCoqui:
 
     def _worker_loop(self):
         """
-        Toma textos de la cola, sintetiza, aplica crossfade con la frase anterior,
+        Toma textos de la cola, sintetiza, aplica trim de silencios, crossfade con la frase anterior,
         trocea en ~100 ms y alimenta audio_pipe sin bloquear la UI.
         Mantiene la cola de PCM por delante para evitar underflow.
         """
@@ -219,11 +251,17 @@ class TTSCoqui:
             wav_48k = _resample_numpy(wav_24k, XTTS_NATIVE_SR, SR)
             wav_48k = _normalize_peak(wav_48k, peak=0.97)
 
-            # 3) Crossfade con la frase anterior (10 ms)
+            # 3) ✅ NUEVO: Trimear silencios al inicio/final
+            wav_48k = _trim_silence(wav_48k, threshold=SILENCE_THRESHOLD)
+            if len(wav_48k) == 0:
+                logger.warning(f"Frase completamente silenciosa después de trim: '{text[:60]}'")
+                continue
+
+            # 4) Crossfade con la frase anterior (50 ms)
             wav_48k = _crossfade_join(self._prev_tail, wav_48k)
             self._prev_tail = wav_48k[-XF_SAMPLES:].copy() if len(wav_48k) >= XF_SAMPLES else wav_48k[-len(wav_48k):].copy()
 
-            # 4) Trocear y alimentar audio
+            # 5) Trocear y alimentar audio
             chunks = _chunkify(wav_48k, TARGET_FRAMES_PER_CHUNK)
             logger.info(f"TTS enqueue (worker): '{text[:60].strip()}...' chunks={len(chunks)}")
             for c in chunks:

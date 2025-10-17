@@ -6,6 +6,7 @@ WASAPI output → VB-Audio CABLE Input (48 kHz, mono), low-latency callback + FI
 - Soft-clip 0.98 para evitar clipping en OBS.
 - Selección de dispositivo por substring (AUDIO_DEVICE_NAME), fallback al default.
 - Drenaje de cola: pending_seconds() y wait_empty(timeout_s) para respuestas largas.
+- Logging de underruns para diagnosticar distorsión.
 
 Env (.env):
   AUDIO_DEVICE_NAME=CABLE Input (VB-Audio Virtual Cable)
@@ -110,8 +111,9 @@ class AudioPipe:
         self._queue_lock = threading.Lock()
         self._queue_frames = 0  # total de muestras en cola
 
-        # Para rate-limiting de logs de underflow
+        # Para rate-limiting de logs de underflow y low buffer
         self._last_underflow_log = 0.0
+        self._last_lowbuffer_log = 0.0
 
         # Condición para wait_empty()
         self._empty_cv = threading.Condition(self._queue_lock)
@@ -212,18 +214,30 @@ class AudioPipe:
         """
         Callback de sounddevice. Debe escribir exactamente 'frames' muestras por canal.
         Si no hay datos, rellena con silencio. Aplica soft-clip 0.98.
+        Loguea underruns y low-buffer conditions.
         """
         if status:
             # Loguear xruns/underruns con rate limit
             now = time.time()
             if now - self._last_underflow_log > 2.0:  # 1 log / 2s
-                logger.warning(f"Audio status: {status}")
+                logger.warning(f"⚠️ Audio status: {status}")
                 self._last_underflow_log = now
 
         needed = frames
         out = None
 
         with self._queue_lock:
+            # ✅ NUEVO: Detectar buffer bajo (< 2× blocksize = ~20 ms @ 48kHz)
+            if self._queue_frames > 0 and self._queue_frames < (self.blocksize * 2):
+                now = time.time()
+                if now - self._last_lowbuffer_log > 2.0:  # 1 log / 2s
+                    pending_ms = (self._queue_frames / self.samplerate) * 1000.0
+                    logger.warning(
+                        f"🔴 LOW BUFFER: {self._queue_frames} frames ({pending_ms:.1f} ms) — "
+                        f"posible underrun inminente"
+                    )
+                    self._last_lowbuffer_log = now
+
             # Consumir de la cola hasta llenar 'frames'
             chunks = []
             while needed > 0 and self._queue:
